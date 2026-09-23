@@ -93,6 +93,48 @@ error,<错误码>,<位置>,<说明>
 - 过滤条件要**短路**：`AND` 左边为假就不再算右边，`OR` 左边为真就不再算右边，别把整行每个条件都算一遍；
 - 类型检查在读取数据之前完成，别等扫完数据才报类型错。
 
+## 实现说明
+
+### 模块划分
+
+- `logquery/lexer.py`：词法分析，把查询切分为关键字、字段名、整数、字符串、运算符和括号；每个 token 保留从 1 开始的 Unicode 码点位置。
+- `logquery/parser.py`：递归下降语法分析，生成 AST；表达式按 `NOT`、`AND`、`OR` 的优先级组织。
+- `logquery/schema.py`：固定字段名与字段类型。
+- `logquery/semantic.py`：执行前校验字段、聚合函数、比较类型、聚合/分组组合和 `ORDER BY` 可引用对象。
+- `logquery/executor.py`：读取 CSV、执行三值逻辑过滤、聚合、确定性排序并生成 CSV。
+- `logquery/__main__.py`：命令行入口。
+- `tests/test_logquery.py`：基于 `unittest` 的回归测试，覆盖样例错误位置、空值、聚合、确定性和短路行为。
+
+### 执行前校验
+
+`executor.execute_query()` 的顺序固定为：
+
+1. 调用 `parse_query()` 完成词法和语法分析；
+2. 调用 `validate_query()` 遍历 AST，只依据固定 schema 检查字段、类型和聚合规则；
+3. 全部通过后才打开并读取数据文件。
+
+因此，`TYPE_MISMATCH`、`UNKNOWN_FIELD`、`UNKNOWN_FUNCTION`、`MIXED_WITHOUT_GROUP_BY` 和 `BAD_LIMIT` 都不会在扫描部分数据后才抛出。
+
+### 三值逻辑与短路
+
+条件值为真、假或未知。`evaluate_condition()` 递归执行 AST：
+
+- `AND` 的左侧为假时立即返回假，不计算右侧；
+- `OR` 的左侧为真时立即返回真，不计算右侧；
+- `NOT 未知` 仍为未知；
+- 只有最终结果为真的行才进入投影或聚合。
+
+字段值在首次访问时才按 schema 转换并缓存；被短路跳过的右侧条件不会触发对应字段读取或转换。
+
+### 命令行
+
+```bash
+python3 -m logquery samples/logs.csv samples/queries/q-1.sql
+python3 -m logquery samples/logs.csv --sql "SELECT count(*) FROM logs"
+```
+
+成功时把 CSV 写到标准输出；查询错误时把 `error,<错误码>,<位置>,<说明>` 写到标准输出并以非零状态退出。
+
 ## 样例
 
 ```text
@@ -104,7 +146,3 @@ samples/expected/bad-N.txt       期望的错误码与位置（error,<码>,<位�
 ```
 
 六条正确查询分别覆盖：单表聚合 + 多条件过滤（`q-1`）、分组聚合 + 别名 + 排序 + `LIMIT`（`q-2`）、多字段分组与分组排序（`q-3`）、纯投影 + `LIMIT`（`q-4`）、多聚合的极值（`q-5`）、null 分组与 `count(field)` 的空值语义（`q-6`）。七条错误查询覆盖缺表名、字段名拼错、类型不匹配、缺 `GROUP BY`、`avg` 用错类型、括号没闭合、`GROUP BY` 引用不存在的字段。
-
-## 待补的文档
-
-实现完成后补上：解析器与执行器的模块划分、类型检查是怎么在读取数据之前做完的、短路是怎么实现的。
