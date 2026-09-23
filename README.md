@@ -105,6 +105,44 @@ samples/expected/bad-N.txt       期望的错误码与位置（error,<码>,<位�
 
 六条正确查询分别覆盖：单表聚合 + 多条件过滤（`q-1`）、分组聚合 + 别名 + 排序 + `LIMIT`（`q-2`）、多字段分组与分组排序（`q-3`）、纯投影 + `LIMIT`（`q-4`）、多聚合的极值（`q-5`）、null 分组与 `count(field)` 的空值语义（`q-6`）。七条错误查询覆盖缺表名、字段名拼错、类型不匹配、缺 `GROUP BY`、`avg` 用错类型、括号没闭合、`GROUP BY` 引用不存在的字段。
 
-## 待补的文档
+## 实现说明
 
-实现完成后补上：解析器与执行器的模块划分、类型检查是怎么在读取数据之前做完的、短路是怎么实现的。
+### 模块划分
+
+```text
+logql/
+  errors.py    QueryError：错误码 + 1 起始的码点位置 + 说明
+  lexer.py     词法分析：标识符/整数/字符串（'' 转义）/运算符/括号，产出带位置的 token
+  parser.py    语法分析：递归下降，token 流 -> AST（Query/SelectItem/Compare/And/Or/Not）
+  checker.py   语义检查：字段存在性、比较两侧类型、sum/avg 列类型、MIXED 检查
+  executor.py  执行器：条件编译、流式扫描、分组聚合、稳定排序、CSV 格式化
+  __main__.py  命令行入口
+tests/         unittest：test_samples.py 对照样例，test_unit.py 覆盖语义细节
+```
+
+命令行用法：`python -m logql <查询文件|-> [--csv 数据文件]`，出错时输出
+`error,<错误码>,<位置>,<说明>` 并以退出码 1 结束。
+
+### 类型检查如何先于读数据完成
+
+`run()` 的顺序是 `parse -> check -> execute`。`check()` 只遍历 AST，对照
+`checker.SCHEMA` 里的固定表结构做全量检查：选择列表的字段与聚合参数是否存在、
+`sum`/`avg` 是否用在整数列、WHERE 里每个比较两侧的字段类型与字面量类型是否一致、
+GROUP BY / ORDER BY 的引用是否存在、无 GROUP BY 时字段与聚合是否混用。任何一处
+不满足都在这一步抛 `QueryError`；只有全部通过，`execute()` 才会打开 CSV 文件。
+因此类型错误一定在读数据之前报出，不会跑到一半才崩。
+
+### 短路是怎么实现的
+
+`executor._compile_condition` 把条件 AST 编译成嵌套闭包，返回三值逻辑结果
+（`True`/`False`/`None`，`None` 表示未知）。`AND` 闭包先算左边，左边为 `False`
+直接返回、不再调用右边闭包；`OR` 闭包左边为 `True` 直接返回。每个比较闭包只做
+一次数组下标取值和一次运算符调用，行内没有多余计算。聚合也是单趟流式：每行只
+更新命中分组的累加槽，不物化中间结果。
+
+### 确定性
+
+分组结果先按分组键升序排列（null 最前，键内逐字段比较），再在其上做 ORDER BY
+的稳定排序（Python 的 `list.sort` 是稳定的，多键按从后到前的顺序逐键排），并列
+行保持进入排序前的相对顺序。`avg` 用 `Decimal` 以 `ROUND_HALF_UP` 保留三位小数，
+不经过浮点。因此同一查询同一数据跑两遍输出逐字节一致。
