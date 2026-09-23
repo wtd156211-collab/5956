@@ -1,0 +1,1 @@
+error,MIXED_WITHOUT_GROUP_BY,8

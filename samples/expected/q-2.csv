@@ -1,0 +1,4 @@
+service,n,avg_latency
+api,6025,2619.015
+pay,3977,2572.953
+auth,3958,2609.900
